@@ -11,6 +11,7 @@ import logging
 import textwrap
 from typing import *
 from functools import lru_cache
+from collections import OrderedDict
 
 # 3rdparty
 import requests
@@ -73,6 +74,17 @@ log.setLevel(logging.DEBUG)
 
 
 #------------------------------------------------------------------------------
+# Utils
+#------------------------------------------------------------------------------
+
+@lru_cache(maxsize=1024)
+def snake2camel(snake: str) -> str:
+    return snake.replace('_', ' ').title().replace(' ', '')
+
+def upper_first(s: str) -> str:
+    return s[:1].upper() + s[1:]
+
+#------------------------------------------------------------------------------
 # API types extraction logic
 #------------------------------------------------------------------------------
 
@@ -89,7 +101,7 @@ FieldType = Union[String, Integer, Float, Bool, Array, Ref]
 class Field(NamedTuple):
     name: str
     description: str
-    types: List[FieldType]
+    ty: FieldType
     optional: bool
 
 
@@ -183,7 +195,7 @@ class ApiTypeSignature:
 
 
 class Context:
-    types_repository: Dict[str, FieldType] = {}
+    types_repository: Dict[str, ApiType] = OrderedDict()
     current_type_name: str
 
 
@@ -205,12 +217,12 @@ def extract_type(ctx: Context, sign: ApiTypeSignature) -> ApiType:
         return ApiType(
             name=name,
             description=desc,
-            fields=extract_type_fields(ctx, sign.table),
+            fields=extract_fields(ctx, sign.table),
             kinds=None,
         )
 
 
-def extract_type_fields(ctx: Context, table: Elem) -> List[Field]:
+def extract_fields(ctx: Context, table: Elem) -> List[Field]:
     fields: List[Field] = []
     # First row skipped because it contains headers
     for tr in table.xpath('.//tr[position()>1]'):
@@ -227,12 +239,43 @@ def extract_type_fields(ctx: Context, table: Elem) -> List[Field]:
             name=name,
             optional=desc.startswith('Optional'),
             description=desc,
-            types=[
-                determine_field_type(ctx, x)
-                for x in types.split(' or ')
-            ]
+            ty=generate_field_type(ctx, name, types)
         ))
     return fields
+
+
+def generate_field_type(ctx: Context, field_name: str, raw_types: str) -> FieldType:
+    type_names = [x.strip() for x in raw_types.split(' or ')]
+
+    if len(type_names) == 1:
+        return determine_field_type(ctx, type_names[0])
+    else:
+        return generate_complex_field_type(ctx, field_name, type_names)
+
+
+def generate_complex_field_type(ctx: Context, field_name: str, type_names: List[str]) -> FieldType:
+    camel = snake2camel(field_name)
+    poly_name = f'Polymorph{camel}'
+    if poly_name not in ctx.types_repository:
+        ctx.types_repository[poly_name] = ApiType(
+            name=poly_name,
+            description='',
+            fields=None,
+            kinds=[
+                Ref(name=name, recursive=False)
+                for name in type_names
+            ]
+        )
+    return Ref(name=poly_name, recursive=False)
+
+
+class ApiType(NamedTuple):
+    name: str
+    description: str
+    #: Used for regular type only
+    fields: List[Field]
+    #: Used for enum type only
+    kinds: List[Ref]
 
 
 @lru_cache(maxsize=1024)
@@ -275,12 +318,13 @@ def iter_types(ctx: Context, html: bytes) -> Iterator[ApiType]:
             if resp == SIGN_MATCHED:
                 ty = extract_type(ctx, sign)
                 ctx.types_repository[ty.name] = ty
-                yield ty
                 sign.clear()
                 break
 
             if resp == SIGN_STOP:
                 break
+
+    return ctx.types_repository.values()
 
 
 def match_xpath(elem: Elem, xpath: str) -> bool:
@@ -411,10 +455,7 @@ def extract_method_params(ctx: Context, table: Elem) -> List[Field]:
             name=name,
             optional=(required == 'Optional'),
             description=desc,
-            types=[
-                determine_field_type(ctx, x)
-                for x in types.split(' or ')
-            ]
+            ty=generate_field_type(ctx, name, types)
         ))
 
     return fields
@@ -422,7 +463,7 @@ def extract_method_params(ctx: Context, table: Elem) -> List[Field]:
 
 def extract_method(ctx: Context, sign: ApiMethodSignature) -> ApiMethod:
     return ApiMethod(
-        name=plain_text(sign.h4),
+        name=upper_first(plain_text(sign.h4)),
         description=plain_text(sign.p),
         params=extract_method_params(ctx, sign.table),
         rets=extract_return_types(ctx, sign.p))
@@ -457,7 +498,7 @@ def iter_methods(ctx: Context, html: bytes) -> Iterator[ApiType]:
 # Rust types generator
 #------------------------------------------------------------------------------
 
-def transform_to_rust_type(t: FieldType, optional: bool):
+def transform_to_rust_type(t: FieldType, optional: bool) -> str:
     tpl = 'Option<{}>' if optional else '{}'
 
     if isinstance(t, String):
@@ -476,6 +517,7 @@ def transform_to_rust_type(t: FieldType, optional: bool):
 
     raise RuntimeError(f'Unknown type: {t}')
 
+
 def generate_rust_struct(t: ApiType):
     out = []
     out.append(doc_line_wrap(t.description))
@@ -483,34 +525,52 @@ def generate_rust_struct(t: ApiType):
     out.append(f'pub struct {t.name} ' + '{')
     for f in t.fields:
         out.append(doc_line_wrap(f.description, indent=4))
-
-        # TODO: Add handling multiple types
-        if len(f.types) > 1:
-            raise NotImplementedError("Multiple types not supported")
-
-        ty = f.types[0]
-        rust_type = transform_to_rust_type(ty, f.optional)
+        rust_type = transform_to_rust_type(f.ty, f.optional)
         rust_name = RUST_FIELDS_RENAME_RULES.get(f.name, f.name)
         if rust_name != f.name:
             out.append(f'    #[serde(rename = "{f.name}")]')
-        if isinstance(ty, Ref) and ty.recursive:
+        if isinstance(f.ty, Ref) and f.ty.recursive:
             out.append(f'    pub {rust_name}: Box<{rust_type}>,')
         else:
             out.append(f'    pub {rust_name}: {rust_type},')
     out.append('}')
     return '\n'.join(out)
 
-def generate_rust_enum(t: ApiType):
+
+def generate_rust_method_struct(ctx: Context, m: ApiMethod):
+    out = []
+    out.append(doc_line_wrap(m.description))
+    out.append('#[derive(Debug, Clone, PartialEq, PartialOrd, Serialize, Deserialize)]')
+    out.append(f'pub struct {m.name} ' + '{')
+    for p in m.params:
+        out.append(doc_line_wrap(p.description, indent=4))
+        rust_type = transform_to_rust_type(p.ty, p.optional)
+        rust_name = RUST_FIELDS_RENAME_RULES.get(p.name, p.name)
+        if rust_name != p.name:
+            out.append(f'    #[serde(rename = "{p.name}")]')
+        if isinstance(p.ty, Ref) and p.ty.recursive:
+            out.append(f'    pub {rust_name}: Box<{rust_type}>,')
+        else:
+            out.append(f'    pub {rust_name}: {rust_type},')
+    out.append('}')
+    return '\n'.join(out)
+
+
+def generate_rust_enum(ctx: Context, t: ApiType):
     out = []
     out.append(doc_line_wrap(t.description))
     out.append('#[derive(Debug, Clone, PartialEq, PartialOrd, Serialize, Deserialize)]')
     out.append(f'pub enum {t.name} ' + '{')
+
     for r in t.kinds:
-        out.append(f'    {r.name}({r.name}),')
+        ty = determine_field_type(ctx, r.name)
+        kind_val = transform_to_rust_type(ty, False)
+        out.append(f'    {r.name}({kind_val}),')
     out.append('}')
     return '\n'.join(out)
 
-def generate_rust_types(types: Iterator[ApiType]) -> str:
+
+def generate_rust_types(ctx: Context, types: Iterator[ApiType]) -> str:
     out = []
     out.append(
         '#[macro_use]\n'
@@ -520,14 +580,25 @@ def generate_rust_types(types: Iterator[ApiType]) -> str:
     for t in types:
         out.append('\n')
         if t.kinds is not None:
-            out.append(generate_rust_enum(t))
+            out.append(generate_rust_enum(ctx, t))
         elif t.fields is not None:
             out.append(generate_rust_struct(t))
         else:
             raise RuntimeError(f"Unknown type: {t}")
     return '\n'.join(out)
 
+
+def generate_rust_module(ctx: Context, types: Iterator[ApiType], methods: Iterator[ApiMethod]):
+    with open('./lib.rs', 'w') as fh:
+        fh.write(generate_rust_types(ctx, types))
+        for m in methods:
+            fh.write(generate_rust_method_struct(ctx, m))
+
+
 def doc_line_wrap(s: str, *, indent: int = 0) -> str:
+    if s == '':
+        return ''
+
     spaces = ' ' * indent
     return f'{spaces}/// ' + f'\n{spaces}/// '.join(textwrap.wrap(s, RUST_LINE_BOUND - indent))
 
@@ -538,21 +609,14 @@ def doc_line_wrap(s: str, *, indent: int = 0) -> str:
 def main():
     html_doc = requests.get('https://core.telegram.org/bots/api').content
     ctx = Context()
-    types = tuple(iter_types(ctx, html_doc))
-    methods = iter_methods(ctx, html_doc)
-   
-    for m in methods:
-        print()
-        print(m.name)
-        for p in m.params:
-            print(f'    {p.name}')
-            print(f'         {p.types}')
-        print(f' -> {m.rets}')
 
-    #print(generate_rust_types(types))
+    tuple(iter_types(ctx, html_doc))
+    methods = tuple(iter_methods(ctx, html_doc))
+    types = iter_types(ctx, html_doc)
 
-    #methods = extract_methods(html_doc, types)
-    #generate_rust_module(types, methods)
+    generate_rust_module(ctx, types, methods)
 
 if __name__ == '__main__':
     main()
+
+# TODO: refactor this shit
