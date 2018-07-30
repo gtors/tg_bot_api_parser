@@ -42,6 +42,11 @@ METHOD_RETURN_TYPE_KEYWORDS = (
     'Returns',
 )
 
+EARLY_TYPE_RENAME_RULES = {
+    'InputFile or String': 'String',
+    'InputFile': 'String',
+}
+
 TYPE_RENAME_RULES = {
     'CallbackGame': 'String',
     'Bool': 'Boolean',
@@ -51,6 +56,7 @@ TYPE_RENAME_RULES = {
     'Float number': 'Float',
     'Str': 'String',
     'Int': 'Integer',
+    'InputMediaPhoto and InputMediaVideo': 'InputMedia',
 }
 
 RUST_LINE_BOUND = 80
@@ -183,7 +189,7 @@ class ApiTypeSignature:
         if self.p is not None and elem.tag == 'table':
             has_header = lambda hd: match_xpath(elem, f'.//td/strong[. = "{hd}"]')
             return (
-                has_header('Field') and
+                (has_header('Field') or has_header('Parameters')) and
                 has_header('Type') and
                 has_header('Description')
             )
@@ -245,6 +251,7 @@ def extract_fields(ctx: Context, table: Elem) -> List[Field]:
 
 
 def generate_field_type(ctx: Context, field_name: str, raw_types: str) -> FieldType:
+    raw_types = EARLY_TYPE_RENAME_RULES.get(raw_types, raw_types)
     type_names = [x.strip() for x in raw_types.split(' or ')]
 
     if len(type_names) == 1:
@@ -278,7 +285,7 @@ class ApiType(NamedTuple):
     kinds: List[Ref]
 
 
-@lru_cache(maxsize=1024)
+#@lru_cache(maxsize=1024)
 def determine_field_type(ctx: Context, raw: str) -> Type:
     raw = raw.strip()
     raw = TYPE_RENAME_RULES.get(raw, raw)
@@ -294,7 +301,7 @@ def determine_field_type(ctx: Context, raw: str) -> Type:
         raw = raw.replace('Array of', '', 1)
         return Array(of=determine_field_type(ctx, raw.strip()))
     if raw[0].isupper():
-        recursive=(ctx.current_type_name == raw)
+        recursive = (ctx.current_type_name == raw)
         return Ref(name=raw, recursive=recursive)
     raise RuntimeError(f"Unknown type: {raw}")
 
@@ -513,7 +520,10 @@ def transform_to_rust_type(t: FieldType, optional: bool) -> str:
         rust_type = transform_to_rust_type(t.of, False)
         return tpl.format(f'Vec<{rust_type}>')
     if isinstance(t, Ref):
-        return tpl.format(f'{t.name}')
+        if t.recursive:
+            return tpl.format(f'Box<{t.name}>')
+        else:
+            return tpl.format(f'{t.name}')
 
     raise RuntimeError(f'Unknown type: {t}')
 
@@ -529,10 +539,7 @@ def generate_rust_struct(t: ApiType):
         rust_name = RUST_FIELDS_RENAME_RULES.get(f.name, f.name)
         if rust_name != f.name:
             out.append(f'    #[serde(rename = "{f.name}")]')
-        if isinstance(f.ty, Ref) and f.ty.recursive:
-            out.append(f'    pub {rust_name}: Box<{rust_type}>,')
-        else:
-            out.append(f'    pub {rust_name}: {rust_type},')
+        out.append(f'    pub {rust_name}: {rust_type},')
     out.append('}')
     return '\n'.join(out)
 
@@ -593,6 +600,7 @@ def generate_rust_module(ctx: Context, types: Iterator[ApiType], methods: Iterat
         fh.write(generate_rust_types(ctx, types))
         for m in methods:
             fh.write(generate_rust_method_struct(ctx, m))
+            fh.write("\n\n")
 
 
 def doc_line_wrap(s: str, *, indent: int = 0) -> str:
