@@ -7,11 +7,13 @@
 # std
 import re
 import io
+import os
 import logging
 import textwrap
 from typing import *
 from functools import lru_cache
 from collections import OrderedDict
+from dataclasses import dataclass
 
 # 3rdparty
 import requests
@@ -59,6 +61,10 @@ TYPE_RENAME_RULES = {
     'InputMediaPhoto and InputMediaVideo': 'InputMedia',
 }
 
+COMPLEX_TYPE_RENAME_RULES = {
+    'InputFile or String': 'String',
+}
+
 RUST_LINE_BOUND = 80
 
 RUST_FIELDS_RENAME_RULES = {
@@ -76,7 +82,12 @@ SIGN_STOP = 2
 
 log = logging.getLogger('console')
 log.addHandler(logging.StreamHandler())
-log.setLevel(logging.DEBUG)
+
+is_debug = 'DEBUG' in os.environ
+if is_debug:
+    log.setLevel(logging.DEBUG)
+else:
+    log.setLevel(logging.ERROR)
 
 
 #------------------------------------------------------------------------------
@@ -104,14 +115,16 @@ Ref = NamedTuple('Ref', [('name', str), ('recursive', bool)])
 FieldType = Union[String, Integer, Float, Bool, Array, Ref]
 
 
-class Field(NamedTuple):
+@dataclass
+class Field:
     name: str
     description: str
     ty: FieldType
     optional: bool
 
 
-class ApiType(NamedTuple):
+@dataclass
+class ApiType:
     name: str
     description: str
     #: Used for regular type only
@@ -120,6 +133,7 @@ class ApiType(NamedTuple):
     kinds: List[Ref]
 
 
+@dataclass
 class ApiTypeSignature:
     """ HTML signature of API Type.
 
@@ -187,7 +201,7 @@ class ApiTypeSignature:
 
     def _is_struct(self, elem: Elem) -> bool:
         if self.p is not None and elem.tag == 'table':
-            has_header = lambda hd: match_xpath(elem, f'.//td/strong[. = "{hd}"]')
+            has_header = lambda hd: match_xpath(elem, f'.//th[. = "{hd}"]')
             return (
                 (has_header('Field') or has_header('Parameters')) and
                 has_header('Type') and
@@ -198,6 +212,17 @@ class ApiTypeSignature:
 
     def _is_enum(self, elem: Elem) -> bool:
         return self.p is not None and elem.tag == 'ul'
+
+    def __str__(self):
+        return (
+            f"{self.__class__.__name__}("
+            f"h4={xml(self.h4)},"
+            f"p={xml(self.p)},"
+            f"blockquote={xml(self.blockquote)},"
+            f"table={xml(self.table)},"
+            f"ul={xml(self.ul)}"
+            f")"
+        )
 
 
 class Context:
@@ -231,7 +256,7 @@ def extract_type(ctx: Context, sign: ApiTypeSignature) -> ApiType:
 def extract_fields(ctx: Context, table: Elem) -> List[Field]:
     fields: List[Field] = []
     # First row skipped because it contains headers
-    for tr in table.xpath('.//tr[position()>1]'):
+    for tr in table.xpath('.//tbody/tr'):
         #try:
         (td1, td2, td3) = tr.getchildren()
         #except ValueError:
@@ -287,6 +312,9 @@ class ApiType(NamedTuple):
 
 #@lru_cache(maxsize=1024)
 def determine_field_type(ctx: Context, raw: str) -> Type:
+    if is_debug:
+        log.debug(f"Determine field type for {raw}")
+
     raw = raw.strip()
     raw = TYPE_RENAME_RULES.get(raw, raw)
     if raw == 'String':
@@ -352,6 +380,7 @@ class ApiMethod(NamedTuple):
     rets: List[Type]
 
 
+@dataclass
 class ApiMethodSignature:
     """ HTML signature of API method
 
@@ -422,9 +451,9 @@ class ApiMethodSignature:
 
     def _is_params(self, elem: Elem) -> bool:
         if self.p is not None and elem.tag == 'table':
-            has_header = lambda hd: match_xpath(elem, f'.//td/strong[. = "{hd}"]')
+            has_header = lambda hd: match_xpath(elem, f'.//th[. = "{hd}"]')
             return (
-                has_header('Parameters') and
+                has_header('Parameter') and
                 has_header('Type') and
                 has_header('Required') and
                 has_header('Description')
@@ -432,8 +461,21 @@ class ApiMethodSignature:
         else:
             return False
 
+    def __str__(self):
+        return (
+            f"{self.__class__.__name__}("
+            f"h4={xml(self.h4)},"
+            f"p={xml(self.p)},"
+            f"blockquote={xml(self.blockquote)},"
+            f"table={xml(self.table)}"
+            f")"
+        )
+
 
 def extract_return_types(ctx: Context, elem: Elem) -> List[Type]:
+    if is_debug:
+        log.debug(f"Extract return types from {xml(elem)}")
+
     desc = plain_text(elem)
     # Find line which contains return type description
     s = next(s for s in desc.split('.') if any((kw in s) for kw in METHOD_RETURN_TYPE_KEYWORDS))
@@ -445,13 +487,16 @@ def extract_return_types(ctx: Context, elem: Elem) -> List[Type]:
 
 
 def extract_method_params(ctx: Context, table: Elem) -> List[Field]:
+    if is_debug:
+        log.debug(f"Extract method params from {xml(table)}")
+
     fields: List[Field] = []
 
     if table is None:
         return fields
 
     # First row skipped because it contains headers
-    for tr in table.xpath('.//tr[position()>1]'):
+    for tr in table.xpath('.//tbody/tr'):
         (td1, td2, td3, td4) = tr.getchildren()
         name = plain_text(td1).strip()
         types = plain_text(td2).strip()
@@ -469,6 +514,9 @@ def extract_method_params(ctx: Context, table: Elem) -> List[Field]:
 
 
 def extract_method(ctx: Context, sign: ApiMethodSignature) -> ApiMethod:
+    if is_debug:
+        log.debug(f"Extract API method from sign {sign}")
+
     return ApiMethod(
         name=upper_first(plain_text(sign.h4)),
         description=plain_text(sign.p),
@@ -500,6 +548,11 @@ def iter_methods(ctx: Context, html: bytes) -> Iterator[ApiType]:
 
             if resp == SIGN_STOP:
                 break
+
+
+def xml(e: Optional[Elem]) -> str:
+    return e is not None and etree.tostring(e) or ''
+
 
 #------------------------------------------------------------------------------
 # Rust types generator
@@ -623,6 +676,7 @@ def main():
     types = iter_types(ctx, html_doc)
 
     generate_rust_module(ctx, types, methods)
+
 
 if __name__ == '__main__':
     main()
